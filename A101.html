@@ -1,0 +1,614 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Spaceship Open-World with Enemies</title>
+  <style>
+    html, body { margin:0; padding:0; overflow:hidden; background:#000; }
+    canvas { display:block; background: radial-gradient(circle at center, #001, #000 80%); }
+    #info {
+      position:absolute; top:10px; left:10px;
+      color:#0f0; font:14px monospace;
+      white-space: nowrap;
+    }
+    #minimap {
+      position:absolute; top:10px; right:10px;
+      width:200px; height:200px;
+      background:rgba(0,0,0,0.5);
+      border:2px solid #0f0;
+    }
+    #startMenu {
+      position:absolute; top:50%; left:50%; transform:translate(-50%,-50%);
+      background:rgba(0,0,0,0.8);
+      padding:20px;
+      border:2px solid #0f0;
+      color:#0f0;
+      text-align:center;
+      font-family:monospace;
+    }
+    .menuButton {
+      background:#0f0;
+      color:#000;
+      border:none;
+      padding:10px 20px;
+      margin:10px;
+      cursor:pointer;
+      font-family:monospace;
+      font-size:16px;
+    }
+    .menuButton:hover {
+      background:#0c0;
+    }
+    #colorPicker {
+      margin:20px;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="game"></canvas>
+  <div id="info"></div>
+  <canvas id="minimap"></canvas>
+  <div id="startMenu">
+    <h1>Space Battle</h1>
+    <button class="menuButton" id="playButton">Play</button>
+    <div id="colorPicker">
+      <h3>Ship Color</h3>
+      <input type="color" id="shipColor" value="#0f8">
+    </div>
+  </div>
+  <script>
+  (() => {
+    // ——— Setup ———
+    const canvas = document.getElementById('game');
+    const ctx = canvas.getContext('2d');
+    const info = document.getElementById('info');
+    const minimap = document.getElementById('minimap');
+    const mctx = minimap.getContext('2d');
+    const startMenu = document.getElementById('startMenu');
+    const playButton = document.getElementById('playButton');
+    const shipColorInput = document.getElementById('shipColor');
+    minimap.width = 200;
+    minimap.height = 200;
+    let W = window, d = document, e = d.documentElement, g = d.getElementsByTagName('body')[0];
+    function resize(){
+      canvas.width = W.innerWidth||e.clientWidth||g.clientWidth;
+      canvas.height= W.innerHeight||e.clientHeight||g.clientHeight;
+    }
+    window.addEventListener('resize', resize);
+    resize();
+
+    let gameStarted = false;
+    let shipColor = '#0f8';
+    let isInvincible = true;  // Start invincible
+
+    shipColorInput.addEventListener('input', (e) => {
+      shipColor = e.target.value;
+    });
+
+    playButton.addEventListener('click', () => {
+      startMenu.style.display = 'none';
+      gameStarted = true;
+      isInvincible = false;  // Disable invincibility when game starts
+    });
+
+    // ——— Input ———
+    const keys = { w:0,a:0,s:0,d:0 };
+    let mouse = { x:0,y:0 };
+    let hyperSpeed = {
+      max: 5, // seconds
+      current: 5, // seconds
+      rechargeRate: 5/30, // per second
+      active: false
+    };
+    d.addEventListener('keydown', e => {
+      if(keys.hasOwnProperty(e.key)) keys[e.key]=1;
+      if(e.key === 'Shift') hyperSpeed.active = true;
+    });
+    d.addEventListener('keyup',   e => {
+      if(keys.hasOwnProperty(e.key)) keys[e.key]=0;
+      if(e.key === 'Shift') hyperSpeed.active = false;
+    });
+    canvas.addEventListener('mousemove', e => {
+      const r = canvas.getBoundingClientRect();
+      mouse.x = e.clientX - r.left;
+      mouse.y = e.clientY - r.top;
+    });
+    canvas.addEventListener('click', shoot);
+
+    let zoom = 1;
+    canvas.addEventListener('wheel', e => {
+      e.preventDefault();
+      zoom += -e.deltaY * 0.001;
+      zoom = Math.max(0.5, Math.min(2.5, zoom));
+    }, { passive: false });
+
+    // ——— Game State ———
+    const MAX_HEALTH = 100;
+    const MAX_AMMO   = 20;
+    const AMMO_REGEN = 1;   // per second
+    const ENEMY_COUNT = 20;
+
+    let ship = {
+      pos:{x:0,y:0}, vel:{x:0,y:0},
+      acc:0.15, friction:0.97,
+      size:20, health:MAX_HEALTH,
+      ammo: MAX_AMMO, points:0, level:1,
+      landed:false, gameOver: false,
+      color: shipColor
+    };
+
+    const stars = Array.from({length:200}, _=>({
+      x:(Math.random()-0.5)*6000, y:(Math.random()-0.5)*6000,
+      r:Math.random()*1.5+0.3
+    }));
+    // Generate massive, non-overlapping planets
+    function generatePlanets(count) {
+      const planets = [];
+      let attempts = 0;
+      while (planets.length < count && attempts < count * 100) {
+        attempts++;
+        const scale = 10 + Math.random() * 10; // 10x to 20x
+        const r = (Math.random() * 50 + 30) * scale;
+        const x = (Math.random() - 0.5) * 6000;
+        const y = (Math.random() - 0.5) * 6000;
+        const color = `hsl(${Math.random() * 360},60%,50%)`;
+        // Check for overlap
+        let overlaps = false;
+        for (const p of planets) {
+          const minDist = r + p.r + 1000; // 1000px buffer (10x previous)
+          if (Math.hypot(x - p.x, y - p.y) < minDist) {
+            overlaps = true;
+            break;
+          }
+        }
+        if (!overlaps) {
+          planets.push({ x, y, r, color, _landed: false });
+        }
+      }
+      return planets;
+    }
+    const planets = generatePlanets(30);
+
+    const lasers = [];
+    const eLasers = [];
+    const enemies = [];
+
+    function spawnEnemies(){
+      for(let i=0;i<ENEMY_COUNT;i++){
+        let safe = false, pos;
+        let tries = 0;
+        while(!safe && tries < 1000) {
+          tries++;
+          pos = { x:(Math.random()-0.5)*5000, y:(Math.random()-0.5)*5000 };
+          safe = true;
+          for(const p of planets) {
+            if(Math.hypot(pos.x - p.x, pos.y - p.y) < p.r + 300) {
+              safe = false;
+              break;
+            }
+          }
+        }
+        enemies.push({
+          pos,
+          vel:{ x:0,y:0 },
+          acc:0.08, friction:0.96,
+          size:18, health:30,
+          reload:Math.random()*60,
+          role: Math.random() < 0.3 ? 'attacker' : 'supporter', // 30% attackers, 70% supporters
+          targetAngle: 0,
+          formationOffset: { x: 0, y: 0 }
+        });
+      }
+    }
+    spawnEnemies();
+
+    function shoot(){
+      if(ship.ammo>0 && !ship.landed){
+        ship.ammo--;
+        lasers.push({
+          x: ship.pos.x,
+          y: ship.pos.y,
+          angle: shipAngle(),
+          life: 60
+        });
+      }
+    }
+
+    // ——— Helpers ———
+    function shipAngle(){
+      return Math.atan2(
+        mouse.y - canvas.height/2,
+        mouse.x - canvas.width/2
+      );
+    }
+    function dist(a,b){ return Math.hypot(a.x-b.x, a.y-b.y); }
+
+    // ——— Game Loop ———
+    let last = performance.now();
+    function loop(now=0){
+      const dt = (now-last)/1000; last=now;
+      update(dt);
+      draw();
+      requestAnimationFrame(loop);
+    }
+    requestAnimationFrame(loop);
+
+    // ——— Update ———
+    function update(dt){
+      // Ammo regen
+      ship.ammo = Math.min(MAX_AMMO, ship.ammo + AMMO_REGEN*dt);
+
+      // Thrusters (if not landed)
+      let speedFactor = 1;
+      if(hyperSpeed.active && hyperSpeed.current > 0 && !ship.landed) {
+        speedFactor = 3;
+        hyperSpeed.current = Math.max(0, hyperSpeed.current - dt);
+      } else if(hyperSpeed.current < hyperSpeed.max) {
+        hyperSpeed.current = Math.min(hyperSpeed.max, hyperSpeed.current + hyperSpeed.rechargeRate * dt);
+      }
+      if(!ship.landed){
+        const ang = shipAngle();
+        if(keys.w){ ship.vel.x += Math.cos(ang)*ship.acc*speedFactor; ship.vel.y += Math.sin(ang)*ship.acc*speedFactor; }
+        if(keys.s){ ship.vel.x -= Math.cos(ang)*ship.acc*0.5*speedFactor; ship.vel.y -= Math.sin(ang)*ship.acc*0.5*speedFactor; }
+        if(keys.a){
+          ship.vel.x += Math.cos(ang-Math.PI/2)*ship.acc*0.6*speedFactor;
+          ship.vel.y += Math.sin(ang-Math.PI/2)*ship.acc*0.6*speedFactor;
+        }
+        if(keys.d){
+          ship.vel.x += Math.cos(ang+Math.PI/2)*ship.acc*0.6*speedFactor;
+          ship.vel.y += Math.sin(ang+Math.PI/2)*ship.acc*0.6*speedFactor;
+        }
+      }
+
+      // Apply friction
+      ship.vel.x *= ship.friction;
+      ship.vel.y *= ship.friction;
+      ship.pos.x += ship.vel.x;
+      ship.pos.y += ship.vel.y;
+
+      // Lasers update
+      lasers.forEach((l,i) => {
+        l.x += Math.cos(l.angle)*20;
+        l.y += Math.sin(l.angle)*20;
+        // Remove laser if it hits a planet
+        for(const p of planets) {
+          if(Math.hypot(l.x - p.x, l.y - p.y) < p.r) {
+            lasers.splice(i,1);
+            return;
+          }
+        }
+        if(--l.life<=0) lasers.splice(i,1);
+      });
+      // Enemy lasers
+      eLasers.forEach((l,i) => {
+        l.x += Math.cos(l.angle)*12;
+        l.y += Math.sin(l.angle)*12;
+        // Remove enemy laser if it hits a planet
+        for(const p of planets) {
+          if(Math.hypot(l.x - p.x, l.y - p.y) < p.r) {
+            eLasers.splice(i,1);
+            return;
+          }
+        }
+        if(--l.life<=0) eLasers.splice(i,1);
+      });
+
+      // Planets: landing & collision damage
+      ship.landed = false;
+      planets.forEach(p => {
+        const d = dist(ship.pos, p);
+        if(d < p.r + ship.size*0.6){
+          const speed = Math.hypot(ship.vel.x,ship.vel.y);
+          if(speed < 1.5){
+            ship.landed = true;
+            ship.vel.x = ship.vel.y = 0;
+            if(!p._landed){
+              p._landed = true;
+              ship.points += Math.floor(p.r);
+              if(ship.points >= ship.level*100){
+                ship.level++; ship.size += 5;
+              }
+            }
+          } else if(!isInvincible) {
+            // crash: lose health
+            ship.health -= speed*2;
+            if(ship.health<0) ship.health=0;
+          }
+        }
+      });
+
+      // Enemies AI & collision
+      enemies.forEach((en,i) => {
+        // Calculate distance to player
+        const toPlayer = { x: ship.pos.x-en.pos.x, y: ship.pos.y-en.pos.y };
+        const d = Math.hypot(toPlayer.x,toPlayer.y);
+        
+        // Enhanced detection range
+        const DETECTION_RANGE = 800;
+        const ATTACK_RANGE = 600;
+        
+        // Find nearest enemy for formation
+        let nearestEnemy = null;
+        let minDist = Infinity;
+        enemies.forEach((other, j) => {
+          if(i !== j) {
+            const dist = Math.hypot(en.pos.x - other.pos.x, en.pos.y - other.pos.y);
+            if(dist < minDist) {
+              minDist = dist;
+              nearestEnemy = other;
+            }
+          }
+        });
+
+        // Calculate formation position with dynamic spacing
+        if(nearestEnemy) {
+          const baseAngle = Math.atan2(nearestEnemy.pos.y - en.pos.y, nearestEnemy.pos.x - en.pos.x);
+          const spacing = 100 + Math.sin(performance.now() * 0.001) * 20; // Dynamic spacing
+          en.formationOffset = {
+            x: Math.cos(baseAngle + Math.PI/2) * spacing,
+            y: Math.sin(baseAngle + Math.PI/2) * spacing
+          };
+        }
+
+        // Role-based behavior with improved coordination
+        let targetAng = Math.random()*Math.PI*2;
+        if(d < DETECTION_RANGE) {
+          if(en.role === 'attacker') {
+            // Attackers use predictive targeting
+            const playerVel = { x: ship.vel.x, y: ship.vel.y };
+            const predictedPos = {
+              x: ship.pos.x + playerVel.x * 10,
+              y: ship.pos.y + playerVel.y * 10
+            };
+            targetAng = Math.atan2(predictedPos.y - en.pos.y, predictedPos.x - en.pos.x);
+            en.acc = 0.12;
+          } else {
+            // Supporters use dynamic flanking
+            const baseAngle = Math.atan2(toPlayer.y, toPlayer.x);
+            const time = performance.now() * 0.001;
+            const flankOffset = Math.sin(time + i) * Math.PI/2; // Dynamic flanking angle
+            targetAng = baseAngle + flankOffset;
+            en.acc = 0.06;
+          }
+        } else {
+          // Search behavior when player is not in range
+          const searchAngle = (performance.now() * 0.0005 + i * 0.1) % (Math.PI * 2);
+          targetAng = searchAngle;
+          en.acc = 0.04;
+        }
+
+        // Update target angle with smooth rotation
+        const angleDiff = targetAng - en.targetAngle;
+        en.targetAngle += angleDiff * 0.1;
+
+        // Move with formation consideration
+        const targetPos = {
+          x: ship.pos.x + (en.formationOffset?.x || 0),
+          y: ship.pos.y + (en.formationOffset?.y || 0)
+        };
+        const toTarget = { x: targetPos.x - en.pos.x, y: targetPos.y - en.pos.y };
+        const distToTarget = Math.hypot(toTarget.x, toTarget.y);
+        
+        if(distToTarget > 50) { // Only adjust if too far from formation
+          en.vel.x += Math.cos(en.targetAngle)*en.acc;
+          en.vel.y += Math.sin(en.targetAngle)*en.acc;
+        }
+        
+        en.vel.x *= en.friction;
+        en.vel.y *= en.friction;
+        en.pos.x += en.vel.x;
+        en.pos.y += en.vel.y;
+
+        // Shooting with improved accuracy and prediction
+        if(d < ATTACK_RANGE && --en.reload <= 0) {
+          en.reload = en.role === 'attacker' ? 60 : 90;
+          const accuracy = en.role === 'attacker' ? 0.1 : 0.2;
+          const playerVel = { x: ship.vel.x, y: ship.vel.y };
+          const leadAngle = Math.atan2(
+            ship.pos.y + playerVel.y * 5 - en.pos.y,
+            ship.pos.x + playerVel.x * 5 - en.pos.x
+          );
+          const angle = leadAngle + (Math.random() - 0.5) * accuracy;
+          eLasers.push({
+            x: en.pos.x,
+            y: en.pos.y,
+            angle: angle,
+            life: 80
+          });
+        }
+
+        // hit by player lasers
+        lasers.forEach((l,li) => {
+          if(Math.hypot(l.x - en.pos.x, l.y - en.pos.y) < en.size) {
+            en.health -= 20;
+            lasers.splice(li,1);
+          }
+        });
+
+        // enemy death
+        if(en.health<=0) {
+          ship.points += 50;
+          enemies.splice(i,1);
+        }
+      });
+
+      // Enemy lasers hitting ship
+      eLasers.forEach((l,i) => {
+        if(!isInvincible && Math.hypot(l.x - ship.pos.x, l.y - ship.pos.y) < ship.size){
+          ship.health -= 10;
+          eLasers.splice(i,1);
+        }
+      });
+
+      // Clamp health
+      if(ship.health<0) {
+        ship.health = 0;
+        ship.gameOver = true;
+      }
+      // Update HUD
+      info.textContent =
+        ship.gameOver ? 
+        `GAME OVER - Final Score: ${ship.points}` :
+        `Points:${ship.points} | Level:${ship.level} | `+
+        `Health:${Math.floor(ship.health)} | Ammo:${Math.floor(ship.ammo)} | `+
+        `Hyper-speed: ${hyperSpeed.current.toFixed(2)}s`;
+    }
+
+    // ——— Draw ———
+    function draw(){
+      // clear
+      ctx.clearRect(0,0,canvas.width,canvas.height);
+      
+      if(!gameStarted) {
+        return;
+      }
+
+      if(ship.gameOver) {
+        // Draw game over screen
+        ctx.fillStyle = 'rgba(0,0,0,0.8)';
+        ctx.fillRect(0,0,canvas.width,canvas.height);
+        ctx.fillStyle = '#f00';
+        ctx.font = '48px monospace';
+        ctx.textAlign = 'center';
+        ctx.fillText('GAME OVER', canvas.width/2, canvas.height/2);
+        ctx.font = '24px monospace';
+        ctx.fillText(`Final Score: ${ship.points}`, canvas.width/2, canvas.height/2 + 40);
+        return;
+      }
+
+      // Draw minimap
+      mctx.clearRect(0,0,minimap.width,minimap.height);
+      mctx.fillStyle = '#0f0';
+      // Draw player
+      mctx.beginPath();
+      mctx.arc(
+        (ship.pos.x + 3000) / 6000 * minimap.width,
+        (ship.pos.y + 3000) / 6000 * minimap.height,
+        3, 0, Math.PI*2
+      );
+      mctx.fill();
+      // Draw enemies
+      mctx.fillStyle = '#f00';
+      enemies.forEach(en => {
+        mctx.beginPath();
+        mctx.arc(
+          (en.pos.x + 3000) / 6000 * minimap.width,
+          (en.pos.y + 3000) / 6000 * minimap.height,
+          2, 0, Math.PI*2
+        );
+        mctx.fill();
+      });
+      // Draw planets
+      mctx.fillStyle = '#00f';
+      planets.forEach(p => {
+        mctx.beginPath();
+        mctx.arc(
+          (p.x + 3000) / 6000 * minimap.width,
+          (p.y + 3000) / 6000 * minimap.height,
+          Math.max(1, p.r / 100), 0, Math.PI*2
+        );
+        mctx.fill();
+      });
+
+      // world camera
+      ctx.save();
+      ctx.translate(canvas.width/2 - ship.pos.x * zoom,
+                    canvas.height/2 - ship.pos.y * zoom);
+      ctx.scale(zoom, zoom);
+
+      // stars
+      ctx.fillStyle='#fff'; ctx.globalAlpha=0.6;
+      for(const s of stars){
+        ctx.beginPath(); ctx.arc(s.x,s.y,s.r,0,Math.PI*2); ctx.fill();
+      }
+      ctx.globalAlpha=1;
+
+      // planets
+      for(const p of planets){
+        ctx.save();
+        ctx.translate(p.x,p.y);
+        const g = ctx.createRadialGradient(0,0,p.r*0.2,0,0,p.r);
+        g.addColorStop(0,'#fff'); g.addColorStop(1,p.color);
+        ctx.fillStyle = g;
+        ctx.beginPath(); ctx.arc(0,0,p.r,0,Math.PI*2); ctx.fill();
+        ctx.restore();
+      }
+
+      // player lasers
+      ctx.fillStyle='red';
+      lasers.forEach(l=>{
+        ctx.save();
+        ctx.translate(l.x,l.y);
+        ctx.rotate(l.angle);
+        ctx.fillRect(0,-2,20,4);
+        ctx.restore();
+      });
+
+      // enemy lasers
+      ctx.fillStyle='orange';
+      eLasers.forEach(l=>{
+        ctx.save();
+        ctx.translate(l.x,l.y);
+        ctx.rotate(l.angle);
+        ctx.fillRect(0,-2,16,4);
+        ctx.restore();
+      });
+
+      // enemies
+      enemies.forEach(en=>{
+        ctx.save();
+        ctx.translate(en.pos.x,en.pos.y);
+        // health bar
+        ctx.fillStyle='black';
+        ctx.fillRect(-en.size,-en.size-6,en.size*2,4);
+        ctx.fillStyle='lime';
+        ctx.fillRect(-en.size,-en.size-6,
+          (en.health/30)*(en.size*2),4);
+        // ship
+        ctx.rotate(Math.atan2(ship.pos.y-en.pos.y,
+                              ship.pos.x-en.pos.x));
+        ctx.fillStyle='#f80';
+        ctx.beginPath();
+        ctx.moveTo(en.size,0);
+        ctx.lineTo(-en.size/2,en.size/2);
+        ctx.lineTo(-en.size/2,-en.size/2);
+        ctx.closePath(); ctx.fill();
+        ctx.restore();
+      });
+
+      // player ship
+      ctx.save();
+      ctx.translate(ship.pos.x,ship.pos.y);
+      ctx.rotate(shipAngle());
+      // thruster flame
+      const speed = Math.hypot(ship.vel.x,ship.vel.y);
+      if(speed>0.5 && !ship.landed){
+        ctx.save();
+        ctx.translate(-ship.size,0);
+        const f = Math.min(speed*4,ship.size*1.2);
+        const grad = ctx.createLinearGradient(0,0,-f,0);
+        grad.addColorStop(0,'#f00'); grad.addColorStop(1,'#ff0');
+        ctx.fillStyle=grad;
+        ctx.beginPath();
+        ctx.moveTo(0,0);
+        ctx.lineTo(-f,7);
+        ctx.lineTo(-f,-7);
+        ctx.closePath(); ctx.fill();
+        ctx.restore();
+      }
+      // body
+      ctx.fillStyle = ship.landed ? '#08f' : shipColor;
+      ctx.beginPath();
+      ctx.moveTo(ship.size,0);
+      ctx.lineTo(-ship.size/2, ship.size/2);
+      ctx.lineTo(-ship.size/2,-ship.size/2);
+      ctx.closePath(); ctx.fill();
+      ctx.restore();
+
+      ctx.restore();
+    }
+  })();
+  </script>
+</body>
+</html>
