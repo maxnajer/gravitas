@@ -1,0 +1,1238 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Spaceship Open-World with Enemies</title>
+  <style>
+    html, body { margin:0; padding:0; overflow:hidden; background:#000; }
+    canvas { display:block; background: radial-gradient(circle at center, #001, #000 80%); }
+    #info {
+      position:absolute; top:10px; left:10px;
+      color:#0f0; font:14px monospace;
+      white-space: nowrap;
+    }
+    #minimap {
+      position:absolute; top:10px; right:10px;
+      width:200px; height:200px;
+      background:rgba(0,0,0,0.5);
+      border:2px solid #0f0;
+    }
+    #startMenu {
+      position:absolute; top:50%; left:50%; transform:translate(-50%,-50%);
+      background:rgba(0,0,0,0.8);
+      padding:20px;
+      border:2px solid #0f0;
+      color:#0f0;
+      text-align:center;
+      font-family:monospace;
+    }
+    .menuButton {
+      background:#0f0;
+      color:#000;
+      border:none;
+      padding:10px 20px;
+      margin:10px;
+      cursor:pointer;
+      font-family:monospace;
+      font-size:16px;
+    }
+    .menuButton:hover {
+      background:#0c0;
+    }
+    #colorPicker {
+      margin:20px;
+    }
+    #gamertagInput {
+      background:#000;
+      color:#0f0;
+      border:1px solid #0f0;
+      padding:5px;
+      margin:10px;
+      font-family:monospace;
+      text-align:center;
+      width:150px;
+    }
+    #gamertagInput::placeholder {
+      color:#0f0;
+      opacity:0.5;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="game"></canvas>
+  <div id="info"></div>
+  <canvas id="minimap"></canvas>
+  <div id="startMenu">
+    <h1>Space Battle</h1>
+    <input type="text" id="gamertagInput" placeholder="Enter your gamertag" maxlength="15">
+    <button class="menuButton" id="playButton">Play</button>
+    <div id="colorPicker">
+      <h3>Ship Color</h3>
+      <input type="color" id="shipColor" value="#0f8">
+    </div>
+  </div>
+  <script>
+  (() => {
+    // ——— Setup ———
+    const canvas = document.getElementById('game');
+    const ctx = canvas.getContext('2d');
+    const info = document.getElementById('info');
+    const minimap = document.getElementById('minimap');
+    const mctx = minimap.getContext('2d');
+    const startMenu = document.getElementById('startMenu');
+    const playButton = document.getElementById('playButton');
+    const shipColorInput = document.getElementById('shipColor');
+    const gamertagInput = document.getElementById('gamertagInput');
+    minimap.width = 200;
+    minimap.height = 200;
+    let W = window, d = document, e = d.documentElement, g = d.getElementsByTagName('body')[0];
+    function resize(){
+      canvas.width = W.innerWidth||e.clientWidth||g.clientWidth;
+      canvas.height= W.innerHeight||e.clientHeight||g.clientHeight;
+    }
+    window.addEventListener('resize', resize);
+    resize();
+
+    let gameStarted = false;
+    let shipColor = '#0f8';
+    let isInvincible = true;  // Start invincible
+    let gamertag = 'Player';  // Default gamertag
+
+    shipColorInput.addEventListener('input', (e) => {
+      shipColor = e.target.value;
+    });
+
+    gamertagInput.addEventListener('input', (e) => {
+      gamertag = e.target.value || 'Player';
+    });
+
+    playButton.addEventListener('click', () => {
+      startMenu.style.display = 'none';
+      gameStarted = true;
+      isInvincible = false;  // Disable invincibility when game starts
+    });
+
+    // ——— Input ———
+    const keys = { w:0,a:0,s:0,d:0 };
+    let mouse = { x:0,y:0 };
+    let hyperSpeed = {
+      max: 5, // seconds
+      current: 5, // seconds
+      rechargeRate: 5/30, // per second
+      active: false
+    };
+    d.addEventListener('keydown', e => {
+      if(keys.hasOwnProperty(e.key)) keys[e.key]=1;
+      if(e.key === 'Shift') hyperSpeed.active = true;
+    });
+    d.addEventListener('keyup',   e => {
+      if(keys.hasOwnProperty(e.key)) keys[e.key]=0;
+      if(e.key === 'Shift') hyperSpeed.active = false;
+    });
+    canvas.addEventListener('mousemove', e => {
+      const r = canvas.getBoundingClientRect();
+      mouse.x = e.clientX - r.left;
+      mouse.y = e.clientY - r.top;
+    });
+    canvas.addEventListener('click', shoot);
+
+    let zoom = 1;
+    canvas.addEventListener('wheel', e => {
+      e.preventDefault();
+      zoom += -e.deltaY * 0.001;
+      zoom = Math.max(0.5, Math.min(2.5, zoom));
+    }, { passive: false });
+
+    // ——— Game State ———
+    const MAX_HEALTH = 100;
+    const MAX_AMMO   = 20;
+    const AMMO_REGEN = 1;   // per second
+    const GRAVITY_CONSTANT = 0.000075;
+    const COLLISION_DAMAGE_MULTIPLIER = 0.05;
+    const MIN_COLLISION_SPEED = 2;
+    const LASER_DAMAGE = 10;
+    const ENEMY_HEALTH = 20;
+    const GRAVITY_ESCAPE_THRESHOLD = 0.3;
+    const GRAVITY_ESCAPE_DISTANCE = 400;
+    
+    // Spawning constants
+    const SPAWN_DISTANCE = 3000; // Distance from player to spawn new objects
+    const DESPAWN_DISTANCE = 6000; // Distance from player to remove objects (increased)
+    const MAX_ACTIVE_ASTEROIDS = 250; // Reduced by half
+    const MAX_ACTIVE_ENEMIES = 600; // Maximum number of enemies in the game (10x)
+    const ASTEROID_SPAWN_INTERVAL = 0.1; // Much faster asteroid spawn
+    const ENEMY_SPAWN_INTERVAL = 1.67; // Seconds between enemy spawn attempts (decreased from 5)
+
+    const ASTEROID_MIN_SIZE = 15;
+    const ASTEROID_MAX_SIZE = 40;
+    const ASTEROID_ROTATION_SPEED = 0.02;
+    const ASTEROID_SPEED = 0.5;
+    const ASTEROID_MASS_MULTIPLIER = 0.1;
+    const ASTEROID_ORBITAL_SPEED = 0.8;
+    const ASTEROID_MIN_HEALTH = 5;
+    const ASTEROID_MAX_HEALTH = 50;
+
+    let ship = {
+      pos:{x:0,y:0}, vel:{x:0,y:0},
+      acc:0.15, friction:0.97,
+      size:20, health:MAX_HEALTH,
+      ammo: MAX_AMMO, points:0, level:1,
+      gameOver: false,
+      color: shipColor
+    };
+
+    const stars = Array.from({length:400}, _=>({
+      x:(Math.random()-0.5)*6000, y:(Math.random()-0.5)*6000,
+      r:Math.random()*2.2+0.6, // larger and brighter
+      a:0.8+Math.random()*0.4 // higher alpha for more brightness
+    }));
+    // Generate massive, non-overlapping planets
+    function generatePlanets(count) {
+      const planets = [];
+      let attempts = 0;
+      while (planets.length < count && attempts < count * 100) {
+        attempts++;
+        const scale = 10 + Math.random() * 10;
+        const r = (Math.random() * 50 + 30) * scale;
+        const x = (Math.random() - 0.5) * 6000;
+        const y = (Math.random() - 0.5) * 6000;
+        const baseHue = Math.floor(Math.random()*360);
+        const baseSat = 50 + Math.random()*30;
+        const baseLight = 35 + Math.random()*20;
+        // Bands
+        const bandCount = 7 + Math.floor(Math.random()*3);
+        const bands = [];
+        for(let i=0; i<bandCount; i++){
+          // Precompute a smooth wobble for this band
+          const wobble = [];
+          const freq = 2 + Math.random()*2;
+          const amp = 0.08 + Math.random()*0.06;
+          for(let t=0; t<=100; t++){
+            let angle = (t/100)*Math.PI*2;
+            // Use a sum of sines for smoothness
+            let w = Math.sin(angle*freq + i) * amp + Math.sin(angle*(freq+1) + i*2) * amp*0.5;
+            wobble.push(w);
+          }
+          bands.push({
+            y: (i/(bandCount-1) - 0.5) * r * 1.8,
+            height: r * 0.22,
+            hue: (baseHue + 10 + i*8 + Math.sin(i)*10) % 360,
+            sat: baseSat + 8 - i*2,
+            light: baseLight + 10 - i*2,
+            alpha: 0.22 + Math.random()*0.18,
+            wobble: wobble
+          });
+        }
+        // Spots
+        const spotCount = 1 + Math.floor(Math.random()*2);
+        const spots = [];
+        for(let s=0; s<spotCount; s++){
+          let spotX = (Math.random()-0.5) * r*1.2;
+          let spotY = (Math.random()-0.5) * r*1.2;
+          let spotR = r * (0.10 + Math.random()*0.10);
+          let spotHue = (baseHue + 30 + Math.random()*60) % 360;
+          let spotSat = baseSat + 10 + Math.random()*10;
+          let spotLight = baseLight - 10 + Math.random()*10;
+          spots.push({spotX, spotY, spotR, spotHue, spotSat, spotLight});
+        }
+        // Check for overlap
+        let overlaps = false;
+        for (const p of planets) {
+          const minDist = r + p.r + 1000;
+          if (Math.hypot(x - p.x, y - p.y) < minDist) {
+            overlaps = true;
+            break;
+          }
+        }
+        if (!overlaps) {
+          planets.push({ x, y, r, color: `hsl(${baseHue},60%,50%)`, _landed: false,
+            _hue: baseHue, _sat: baseSat, _light: baseLight,
+            _bands: bands, _spots: spots });
+        }
+      }
+      return planets;
+    }
+    const planets = generatePlanets(30);
+
+    const lasers = [];
+    const eLasers = [];
+    const enemies = [];
+    const explosions = []; // New array for explosions
+
+    // Add explosion system
+    function createExplosion(x, y, size, color) {
+      const particleCount = Math.floor(size * 8); // Increased particle count
+      for(let i = 0; i < particleCount; i++) {
+        const angle = (Math.random() * Math.PI * 2);
+        const speed = Math.random() * 8 + 4; // Increased speed
+        const life = Math.random() * 40 + 30; // Longer life
+        const particleSize = Math.random() * 6 + 3; // Larger particles
+        const rotationSpeed = (Math.random() - 0.5) * 0.2; // Random rotation
+        explosions.push({
+          x, y,
+          vx: Math.cos(angle) * speed,
+          vy: Math.sin(angle) * speed,
+          size: particleSize,
+          life,
+          maxLife: life,
+          color: color || '#ff0',
+          rotation: Math.random() * Math.PI * 2,
+          rotationSpeed,
+          scale: 1
+        });
+      }
+    }
+
+    // Initialize empty arrays for dynamic objects
+    const asteroids = [];
+    let lastAsteroidSpawn = 0;
+    let lastEnemySpawn = 0;
+
+    // Function to get a random position outside the visible area
+    function getRandomSpawnPosition() {
+      // Randomly pick a direction and a distance between SPAWN_DISTANCE and SPAWN_DISTANCE*1.5
+      const angle = Math.random() * Math.PI * 2;
+      const dist = SPAWN_DISTANCE + Math.random() * SPAWN_DISTANCE * 0.5;
+      return {
+        x: ship.pos.x + Math.cos(angle) * dist,
+        y: ship.pos.y + Math.sin(angle) * dist
+      };
+    }
+
+    // Function to generate a new asteroid
+    function spawnAsteroid() {
+      if (asteroids.length >= MAX_ACTIVE_ASTEROIDS) return;
+
+      const spawnPos = getRandomSpawnPosition();
+      const size = Math.random() * (ASTEROID_MAX_SIZE - ASTEROID_MIN_SIZE) + ASTEROID_MIN_SIZE;
+      
+      // Determine if this is a slow asteroid
+      const isSlow = Math.random() < 0.8; // 80% chance to be slow
+      const type = isSlow ? 'slow' : 'normal';
+      const speed = isSlow ? ASTEROID_SPEED * 0.1 : ASTEROID_SPEED * (0.5 + Math.random() * 0.5);
+
+      // Find nearest planet for orbital initialization
+      let nearestPlanet = planets[0];
+      let minDist = Infinity;
+      planets.forEach(p => {
+        const dist = Math.hypot(p.x - spawnPos.x, p.y - spawnPos.y);
+        if (dist < minDist) {
+          minDist = dist;
+          nearestPlanet = p;
+        }
+      });
+
+      // Calculate initial velocity towards the center
+      const angleToCenter = Math.atan2(ship.pos.y - spawnPos.y, ship.pos.x - spawnPos.x);
+      const vel = {
+        x: Math.cos(angleToCenter) * speed,
+        y: Math.sin(angleToCenter) * speed
+      };
+
+      // Calculate health based on size
+      const healthScale = (size - ASTEROID_MIN_SIZE) / (ASTEROID_MAX_SIZE - ASTEROID_MIN_SIZE);
+      const health = ASTEROID_MIN_HEALTH + healthScale * (ASTEROID_MAX_HEALTH - ASTEROID_MIN_HEALTH);
+
+      asteroids.push({
+        pos: spawnPos,
+        vel,
+        size,
+        mass: size * ASTEROID_MASS_MULTIPLIER,
+        rotation: Math.random() * Math.PI * 2,
+        rotationSpeed: (Math.random() - 0.5) * ASTEROID_ROTATION_SPEED,
+        shape: generateAsteroidShape(size),
+        health: health,
+        initialHealth: health,
+        type: type
+      });
+    }
+
+    // Function to spawn a new enemy
+    function spawnEnemy() {
+      if (enemies.length >= MAX_ACTIVE_ENEMIES) return;
+
+      const spawnPos = getRandomSpawnPosition();
+      
+        enemies.push({
+        pos: spawnPos,
+        vel: { x: 0, y: 0 },
+        acc: 0.18,
+        friction: 0.96,
+        size: 18,
+        health: ENEMY_HEALTH,
+        initialHealth: ENEMY_HEALTH,
+        reload: Math.random() * 60,
+          hyperSpeed: {
+          max: 5,
+          current: 5,
+          rechargeRate: 5/30,
+            active: false
+          }
+        });
+      }
+
+    function shoot(){
+      if(ship.ammo>0 && !ship.landed){
+        ship.ammo--;
+        lasers.push({
+          x: ship.pos.x,
+          y: ship.pos.y,
+          angle: shipAngle(),
+          life: 60
+        });
+      }
+    }
+
+    // ——— Helpers ———
+    function shipAngle(){
+      return Math.atan2(
+        mouse.y - canvas.height/2,
+        mouse.x - canvas.width/2
+      );
+    }
+    function dist(a,b){ return Math.hypot(a.x-b.x, a.y-b.y); }
+
+    // Helper function to calculate collision damage
+    function calculateCollisionDamage(vel1, vel2, mass1 = 1, mass2 = 1) {
+      // Calculate relative velocity
+      const relVelX = vel1.x - vel2.x;
+      const relVelY = vel1.y - vel2.y;
+      const impactSpeed = Math.hypot(relVelX, relVelY);
+      
+      if (impactSpeed < MIN_COLLISION_SPEED) return 0;
+      
+      // Calculate kinetic energy of collision (KE = 1/2 * m * v^2)
+      const kineticEnergy = 0.5 * (mass1 + mass2) * impactSpeed * impactSpeed;
+      
+      // Convert kinetic energy to damage
+      return kineticEnergy * COLLISION_DAMAGE_MULTIPLIER;
+    }
+
+    // Helper function to calculate orbital velocity
+    function calculateOrbitalVelocity(planet, distance) {
+      // v = sqrt(GM/r) - simplified orbital velocity formula
+      const orbitalSpeed = Math.sqrt((GRAVITY_CONSTANT * planet.r * planet.r) / distance) * ASTEROID_ORBITAL_SPEED;
+      return orbitalSpeed;
+    }
+
+    // Helper function to generate asteroid shape
+    function generateAsteroidShape(size) {
+      const points = [];
+      const segments = Math.floor(Math.random() * 4) + 6; // 6-9 segments
+      for(let i = 0; i < segments; i++) {
+        const angle = (i / segments) * Math.PI * 2;
+        const variance = 0.2 + Math.random() * 0.3; // 0.2-0.5 variance
+        const radius = size * (1 + (Math.random() - 0.5) * variance);
+        points.push({
+          x: Math.cos(angle) * radius,
+          y: Math.sin(angle) * radius
+        });
+      }
+      return points;
+    }
+
+    // ——— Game Loop ———
+    let last = performance.now();
+    function loop(now=0){
+      const dt = (now-last)/1000; last=now;
+      update(dt);
+      draw();
+      requestAnimationFrame(loop);
+    }
+    requestAnimationFrame(loop);
+
+    // ——— Update ———
+    function update(dt){
+      // Ammo regen
+      ship.ammo = Math.min(MAX_AMMO, ship.ammo + AMMO_REGEN*dt);
+
+      // Thrusters (if not landed)
+      let speedFactor = 1;
+      if(hyperSpeed.active && hyperSpeed.current > 0 && !ship.landed) {
+        speedFactor = 3;
+        hyperSpeed.current = Math.max(0, hyperSpeed.current - dt);
+      } else if(hyperSpeed.current < hyperSpeed.max) {
+        hyperSpeed.current = Math.min(hyperSpeed.max, hyperSpeed.current + hyperSpeed.rechargeRate * dt);
+      }
+      if(!ship.landed){
+        const ang = shipAngle();
+        if(keys.w){ ship.vel.x += Math.cos(ang)*ship.acc*speedFactor; ship.vel.y += Math.sin(ang)*ship.acc*speedFactor; }
+        if(keys.s){ ship.vel.x -= Math.cos(ang)*ship.acc*0.5*speedFactor; ship.vel.y -= Math.sin(ang)*ship.acc*0.5*speedFactor; }
+        if(keys.a){
+          ship.vel.x += Math.cos(ang-Math.PI/2)*ship.acc*0.6*speedFactor;
+          ship.vel.y += Math.sin(ang-Math.PI/2)*ship.acc*0.6*speedFactor;
+        }
+        if(keys.d){
+          ship.vel.x += Math.cos(ang+Math.PI/2)*ship.acc*0.6*speedFactor;
+          ship.vel.y += Math.sin(ang+Math.PI/2)*ship.acc*0.6*speedFactor;
+        }
+      }
+
+      // Apply friction
+      ship.vel.x *= ship.friction;
+      ship.vel.y *= ship.friction;
+
+      // Apply planet gravity
+      planets.forEach(p => {
+        const dx = p.x - ship.pos.x;
+        const dy = p.y - ship.pos.y;
+        const distSq = dx * dx + dy * dy;
+        const dist = Math.sqrt(distSq);
+        if (dist > p.r) { // Only apply gravity outside the planet
+          const gravityStrength = (GRAVITY_CONSTANT * p.r * p.r) / distSq;
+          ship.vel.x += dx * gravityStrength;
+          ship.vel.y += dy * gravityStrength;
+        }
+      });
+
+      ship.pos.x += ship.vel.x;
+      ship.pos.y += ship.vel.y;
+
+      // Lasers update
+      lasers.forEach((l,i) => {
+        l.x += Math.cos(l.angle)*20;
+        l.y += Math.sin(l.angle)*20;
+
+        // Apply planet gravity to lasers
+        planets.forEach(p => {
+          const dx = p.x - l.x;
+          const dy = p.y - l.y;
+          const distSq = dx * dx + dy * dy;
+          const dist = Math.sqrt(distSq);
+          if (dist > p.r) { // Only apply gravity outside the planet
+            const gravityStrength = (GRAVITY_CONSTANT * p.r * p.r) / distSq;
+            // Update laser angle based on gravity
+            const currentAngle = Math.atan2(Math.sin(l.angle)*20, Math.cos(l.angle)*20);
+            const gravityAngle = Math.atan2(dy, dx);
+            const newAngle = currentAngle + (gravityAngle - currentAngle) * gravityStrength;
+            l.angle = newAngle;
+          }
+        });
+
+        // Remove laser if it hits a planet
+        for(const p of planets) {
+          if(Math.hypot(l.x - p.x, l.y - p.y) < p.r) {
+            lasers.splice(i,1);
+            return;
+          }
+        }
+        if(--l.life<=0) lasers.splice(i,1);
+      });
+
+      // Enemy lasers
+      eLasers.forEach((l,i) => {
+        l.x += Math.cos(l.angle)*12;
+        l.y += Math.sin(l.angle)*12;
+
+        // Apply planet gravity to enemy lasers
+        planets.forEach(p => {
+          const dx = p.x - l.x;
+          const dy = p.y - l.y;
+          const distSq = dx * dx + dy * dy;
+          const dist = Math.sqrt(distSq);
+          if (dist > p.r) { // Only apply gravity outside the planet
+            const gravityStrength = (GRAVITY_CONSTANT * p.r * p.r) / distSq;
+            // Update laser angle based on gravity
+            const currentAngle = Math.atan2(Math.sin(l.angle)*24, Math.cos(l.angle)*24);
+            const gravityAngle = Math.atan2(dy, dx);
+            const newAngle = currentAngle + (gravityAngle - currentAngle) * gravityStrength;
+            l.angle = newAngle;
+          }
+        });
+
+        // Remove enemy laser if it hits a planet
+        for(const p of planets) {
+          if(Math.hypot(l.x - p.x, l.y - p.y) < p.r) {
+            eLasers.splice(i,1);
+            return;
+          }
+        }
+        if(--l.life<=0) eLasers.splice(i,1);
+      });
+
+      // Planets: collision handling
+      planets.forEach(p => {
+        const d = dist(ship.pos, p);
+        if(d < p.r + ship.size*0.6){
+          // Calculate collision damage based on planet's mass
+          const planetMass = p.r / 10; // Scale planet mass by radius
+          const damage = calculateCollisionDamage(ship.vel, {x: 0, y: 0}, 1, planetMass);
+          if (!isInvincible) {
+            ship.health -= damage;
+          }
+          
+          // Prevent ship from passing through planet
+          const angle = Math.atan2(ship.pos.y - p.y, ship.pos.x - p.x);
+          ship.pos.x = p.x + Math.cos(angle) * (p.r + ship.size*0.6);
+          ship.pos.y = p.y + Math.sin(angle) * (p.r + ship.size*0.6);
+          
+          // Bounce off planet
+          const dot = ship.vel.x * Math.cos(angle) + ship.vel.y * Math.sin(angle);
+          ship.vel.x -= 2 * dot * Math.cos(angle);
+          ship.vel.y -= 2 * dot * Math.sin(angle);
+          // Reduce velocity after collision
+          ship.vel.x *= 0.95;
+          ship.vel.y *= 0.95;
+        }
+      });
+
+      // Enemies AI & collision
+      enemies.forEach((en,i) => {
+        // Calculate distance to player
+        const toPlayer = { x: ship.pos.x-en.pos.x, y: ship.pos.y-en.pos.y };
+        const d = Math.hypot(toPlayer.x,toPlayer.y);
+        
+        // Simple follow behavior
+        const DETECTION_RANGE = 1000;
+        const ATTACK_RANGE = 600;
+        
+        // Update hyperspeed
+        if(en.hyperSpeed.active && en.hyperSpeed.current > 0) {
+          en.hyperSpeed.current = Math.max(0, en.hyperSpeed.current - dt);
+        } else if(en.hyperSpeed.current < en.hyperSpeed.max) {
+          en.hyperSpeed.current = Math.min(en.hyperSpeed.max, en.hyperSpeed.current + en.hyperSpeed.rechargeRate * dt);
+        }
+        
+        if(d < DETECTION_RANGE) {
+          // Check for planets in the way
+          let targetAng = Math.atan2(toPlayer.y, toPlayer.x);
+          let avoidPlanet = false;
+          
+          // Check each planet for potential collision
+          planets.forEach(p => {
+            const toPlanet = { x: p.x - en.pos.x, y: p.y - en.pos.y };
+            const distToPlanet = Math.hypot(toPlanet.x, toPlanet.y);
+            const planetAng = Math.atan2(toPlanet.y, toPlanet.x);
+            
+            // If planet is in front of us and close enough to be a concern
+            if (distToPlanet < p.r + 200) {
+              const angDiff = Math.abs(targetAng - planetAng);
+              if (angDiff < Math.PI/2) { // Planet is in front
+                // Calculate avoidance angle
+                const avoidAng = planetAng + (Math.random() < 0.5 ? Math.PI/2 : -Math.PI/2);
+                targetAng = avoidAng;
+                avoidPlanet = true;
+              }
+            }
+          });
+
+          // AI for hyperspeed usage
+          const playerSpeed = Math.hypot(ship.vel.x, ship.vel.y);
+          const enemySpeed = Math.hypot(en.vel.x, en.vel.y);
+          
+          // Simplified hyperspeed activation logic
+          const shouldUseHyperspeed = (
+            d < DETECTION_RANGE && // Must be in detection range
+            d > 400 && // Not too close
+            (
+              (playerSpeed > enemySpeed) || // Player is faster
+              (d > 800) // Or player is getting away
+            ) &&
+            en.hyperSpeed.current > 0.3 // Have enough charge
+          );
+          
+          // Activate hyperspeed
+          en.hyperSpeed.active = shouldUseHyperspeed;
+
+          // Move towards player (or around planet if avoiding)
+          const speedFactor = en.hyperSpeed.active ? 3 : 1;
+          en.vel.x += Math.cos(targetAng) * en.acc * speedFactor;
+          en.vel.y += Math.sin(targetAng) * en.acc * speedFactor;
+        }
+        
+        en.vel.x *= en.friction;
+        en.vel.y *= en.friction;
+
+        // Apply planet gravity to enemies
+        let strongestGravity = { strength: 0, angle: 0 };
+        planets.forEach(p => {
+          const dx = p.x - en.pos.x;
+          const dy = p.y - en.pos.y;
+          const distSq = dx * dx + dy * dy;
+          const dist = Math.sqrt(distSq);
+          if (dist > p.r) { // Only apply gravity outside the planet
+            const gravityStrength = (GRAVITY_CONSTANT * p.r * p.r) / distSq;
+            const gravityAngle = Math.atan2(dy, dx);
+            
+            // Track strongest gravity pull
+            if (gravityStrength > strongestGravity.strength) {
+              strongestGravity = {
+                strength: gravityStrength,
+                angle: gravityAngle,
+                distance: dist
+              };
+            }
+            
+            en.vel.x += dx * gravityStrength;
+            en.vel.y += dy * gravityStrength;
+          }
+        });
+
+        // Check if bot needs to escape gravity
+        if (strongestGravity.strength > GRAVITY_ESCAPE_THRESHOLD && 
+            strongestGravity.distance < GRAVITY_ESCAPE_DISTANCE &&
+            en.hyperSpeed.current > 0.3) {
+          // Calculate escape angle (opposite to gravity pull)
+          const escapeAngle = strongestGravity.angle + Math.PI;
+          
+          // Activate hyperspeed and move away from planet
+          en.hyperSpeed.active = true;
+          const speedFactor = 3; // Hyperspeed multiplier
+          en.vel.x += Math.cos(escapeAngle) * en.acc * speedFactor;
+          en.vel.y += Math.sin(escapeAngle) * en.acc * speedFactor;
+        }
+
+        en.pos.x += en.vel.x;
+        en.pos.y += en.vel.y;
+
+        // Check for bot-to-bot collisions
+        for(let j = i + 1; j < enemies.length; j++) {
+          const other = enemies[j];
+          const d = Math.hypot(en.pos.x - other.pos.x, en.pos.y - other.pos.y);
+          if(d < en.size + other.size) {
+            // Calculate collision response
+            const angle = Math.atan2(en.pos.y - other.pos.y, en.pos.x - other.pos.x);
+            
+            // Calculate collision damage
+            const damage = calculateCollisionDamage(en.vel, other.vel);
+            en.health -= damage;
+            other.health -= damage;
+            
+            // Move bots apart to prevent overlap
+            const overlap = (en.size + other.size - d) / 2;
+            en.pos.x += Math.cos(angle) * overlap;
+            en.pos.y += Math.sin(angle) * overlap;
+            other.pos.x -= Math.cos(angle) * overlap;
+            other.pos.y -= Math.sin(angle) * overlap;
+            
+            // Reflect velocities
+            const dot1 = en.vel.x * Math.cos(angle) + en.vel.y * Math.sin(angle);
+            const dot2 = other.vel.x * Math.cos(angle) + other.vel.y * Math.sin(angle);
+            
+            en.vel.x -= 2 * dot1 * Math.cos(angle);
+            en.vel.y -= 2 * dot1 * Math.sin(angle);
+            other.vel.x -= 2 * dot2 * Math.cos(angle);
+            other.vel.y -= 2 * dot2 * Math.sin(angle);
+            
+            // Reduce velocity after collision
+            en.vel.x *= 0.95;
+            en.vel.y *= 0.95;
+            other.vel.x *= 0.95;
+            other.vel.y *= 0.95;
+          }
+        }
+
+        // Check for planet collisions and prevent passing through
+        planets.forEach(p => {
+          const d = Math.hypot(en.pos.x - p.x, en.pos.y - p.y);
+          if(d < p.r + en.size) {
+            // Calculate collision damage based on planet's mass
+            const planetMass = p.r / 10; // Scale planet mass by radius
+            const damage = calculateCollisionDamage(en.vel, {x: 0, y: 0}, 1, planetMass);
+            en.health -= damage;
+            
+            // Bounce off planet
+            const angle = Math.atan2(en.pos.y - p.y, en.pos.x - p.x);
+            en.pos.x = p.x + Math.cos(angle) * (p.r + en.size);
+            en.pos.y = p.y + Math.sin(angle) * (p.r + en.size);
+            // Reflect velocity
+            const dot = en.vel.x * Math.cos(angle) + en.vel.y * Math.sin(angle);
+            en.vel.x -= 2 * dot * Math.cos(angle);
+            en.vel.y -= 2 * dot * Math.sin(angle);
+            // Reduce velocity after collision
+            en.vel.x *= 0.95;
+            en.vel.y *= 0.95;
+          }
+        });
+
+        // Simple shooting behavior
+        if(d < ATTACK_RANGE && --en.reload <= 0) {
+          en.reload = 60;
+          const angle = Math.atan2(ship.pos.y - en.pos.y, ship.pos.x - en.pos.x);
+          eLasers.push({
+            x: en.pos.x,
+            y: en.pos.y,
+            angle: angle,
+            life: 80
+          });
+        }
+
+        // hit by player lasers
+        lasers.forEach((l,li) => {
+          if(Math.hypot(l.x - en.pos.x, l.y - en.pos.y) < en.size) {
+            en.health -= LASER_DAMAGE;
+            lasers.splice(li,1);
+          }
+        });
+
+        // enemy death
+        if(en.health<=0) {
+          ship.points += Math.round(en.initialHealth);
+          createExplosion(en.pos.x, en.pos.y, en.size, '#f80');
+          enemies.splice(i,1);
+        }
+      });
+
+      // Enemy lasers hitting ship
+      eLasers.forEach((l,i) => {
+        if(!isInvincible && Math.hypot(l.x - ship.pos.x, l.y - ship.pos.y) < ship.size){
+          ship.health -= LASER_DAMAGE;
+          eLasers.splice(i,1);
+        }
+      });
+
+      // Clamp health
+      if(ship.health<0) {
+        ship.health = 0;
+        ship.gameOver = true;
+        createExplosion(ship.pos.x, ship.pos.y, ship.size, shipColor);
+      }
+
+      // Update explosions
+      explosions.forEach((ex, i) => {
+        ex.x += ex.vx;
+        ex.y += ex.vy;
+        ex.vy += 0.15; // Increased gravity effect
+        ex.rotation += ex.rotationSpeed;
+        ex.scale = ex.life / ex.maxLife; // Scale down over time
+        ex.life--;
+        if(ex.life <= 0) {
+          explosions.splice(i, 1);
+        }
+      });
+
+      // Update asteroids
+      asteroids.forEach((ast, i) => {
+        // Update position and rotation
+        ast.pos.x += ast.vel.x;
+        ast.pos.y += ast.vel.y;
+        ast.rotation += ast.rotationSpeed;
+
+        // Check collisions with player
+        if (!isInvincible) {
+          const d = Math.hypot(ship.pos.x - ast.pos.x, ship.pos.y - ast.pos.y);
+          if (d < ship.size + ast.size) {
+            const damage = calculateCollisionDamage(ship.vel, ast.vel, 1, ast.mass);
+            ship.health -= damage;
+            
+            // Apply collision response
+            const angle = Math.atan2(ship.pos.y - ast.pos.y, ship.pos.x - ast.pos.x);
+            const overlap = (ship.size + ast.size - d) / 2;
+            ship.pos.x += Math.cos(angle) * overlap;
+            ship.pos.y += Math.sin(angle) * overlap;
+            ast.pos.x -= Math.cos(angle) * overlap;
+            ast.pos.y -= Math.sin(angle) * overlap;
+            
+            // Reflect velocities with mass consideration
+            const totalMass = 1 + ast.mass;
+            const dot1 = ship.vel.x * Math.cos(angle) + ship.vel.y * Math.sin(angle);
+            const dot2 = ast.vel.x * Math.cos(angle) + ast.vel.y * Math.sin(angle);
+            
+            ship.vel.x -= 2 * dot1 * Math.cos(angle) * (ast.mass / totalMass);
+            ship.vel.y -= 2 * dot1 * Math.sin(angle) * (ast.mass / totalMass);
+            ast.vel.x -= 2 * dot2 * Math.cos(angle) * (1 / totalMass);
+            ast.vel.y -= 2 * dot2 * Math.sin(angle) * (1 / totalMass);
+          }
+        }
+
+        // Check collisions with enemies
+        enemies.forEach((en, j) => {
+          const d = Math.hypot(en.pos.x - ast.pos.x, en.pos.y - ast.pos.y);
+          if (d < en.size + ast.size) {
+            const damage = calculateCollisionDamage(en.vel, ast.vel, 1, ast.mass);
+            en.health -= damage;
+            ast.health -= damage;
+            
+            // Apply collision response
+            const angle = Math.atan2(en.pos.y - ast.pos.y, en.pos.x - ast.pos.x);
+            const overlap = (en.size + ast.size - d) / 2;
+            en.pos.x += Math.cos(angle) * overlap;
+            en.pos.y += Math.sin(angle) * overlap;
+            ast.pos.x -= Math.cos(angle) * overlap;
+            ast.pos.y -= Math.sin(angle) * overlap;
+            
+            // Reflect velocities with mass consideration
+            const totalMass = 1 + ast.mass;
+            const dot1 = en.vel.x * Math.cos(angle) + en.vel.y * Math.sin(angle);
+            const dot2 = ast.vel.x * Math.cos(angle) + ast.vel.y * Math.sin(angle);
+            
+            en.vel.x -= 2 * dot1 * Math.cos(angle) * (ast.mass / totalMass);
+            en.vel.y -= 2 * dot1 * Math.sin(angle) * (ast.mass / totalMass);
+            ast.vel.x -= 2 * dot2 * Math.cos(angle) * (1 / totalMass);
+            ast.vel.y -= 2 * dot2 * Math.sin(angle) * (1 / totalMass);
+          }
+        });
+
+        // Check collisions with other asteroids
+        for(let j = i + 1; j < asteroids.length; j++) {
+          const other = asteroids[j];
+          const d = Math.hypot(ast.pos.x - other.pos.x, ast.pos.y - other.pos.y);
+          if (d < ast.size + other.size) {
+            const damage = calculateCollisionDamage(ast.vel, other.vel, ast.mass, other.mass);
+            ast.health -= damage;
+            other.health -= damage;
+            
+            // Apply collision response
+            const angle = Math.atan2(ast.pos.y - other.pos.y, ast.pos.x - other.pos.x);
+            const overlap = (ast.size + other.size - d) / 2;
+            ast.pos.x += Math.cos(angle) * overlap;
+            ast.pos.y += Math.sin(angle) * overlap;
+            other.pos.x -= Math.cos(angle) * overlap;
+            other.pos.y -= Math.sin(angle) * overlap;
+            
+            // Reflect velocities with mass consideration
+            const totalMass = ast.mass + other.mass;
+            const dot1 = ast.vel.x * Math.cos(angle) + ast.vel.y * Math.sin(angle);
+            const dot2 = other.vel.x * Math.cos(angle) + other.vel.y * Math.sin(angle);
+            
+            ast.vel.x -= 2 * dot1 * Math.cos(angle) * (other.mass / totalMass);
+            ast.vel.y -= 2 * dot1 * Math.sin(angle) * (other.mass / totalMass);
+            other.vel.x -= 2 * dot2 * Math.cos(angle) * (ast.mass / totalMass);
+            other.vel.y -= 2 * dot2 * Math.sin(angle) * (ast.mass / totalMass);
+          }
+        }
+
+        // Check collisions with lasers
+        lasers.forEach((l, li) => {
+          const d = Math.hypot(l.x - ast.pos.x, l.y - ast.pos.y);
+          if (d < ast.size) {
+            ast.health -= LASER_DAMAGE;
+            lasers.splice(li, 1);
+          }
+        });
+
+        // Remove destroyed asteroids
+        if (ast.health <= 0) {
+          createExplosion(ast.pos.x, ast.pos.y, ast.size, '#888');
+          ship.points += Math.round(ast.initialHealth);
+          asteroids.splice(i, 1);
+        }
+      });
+
+      // Spawn new asteroids
+      lastAsteroidSpawn += dt;
+      if (lastAsteroidSpawn >= ASTEROID_SPAWN_INTERVAL) {
+        lastAsteroidSpawn = 0;
+        // Spawn multiple asteroids if far below max
+        let toSpawn = Math.min(10, MAX_ACTIVE_ASTEROIDS - asteroids.length);
+        for(let i=0; i<toSpawn; i++) spawnAsteroid();
+      }
+
+      // Spawn new enemies
+      lastEnemySpawn += dt;
+      if (lastEnemySpawn >= ENEMY_SPAWN_INTERVAL) {
+        lastEnemySpawn = 0;
+        spawnEnemy();
+      }
+
+      // Clean up objects that are too far away
+      for (let i = asteroids.length - 1; i >= 0; i--) {
+        const ast = asteroids[i];
+        const dist = Math.hypot(ast.pos.x - ship.pos.x, ast.pos.y - ship.pos.y);
+        if (dist > DESPAWN_DISTANCE) {
+          asteroids.splice(i, 1);
+        }
+      }
+
+      for (let i = enemies.length - 1; i >= 0; i--) {
+        const en = enemies[i];
+        const dist = Math.hypot(en.pos.x - ship.pos.x, en.pos.y - ship.pos.y);
+        if (dist > DESPAWN_DISTANCE) {
+          enemies.splice(i, 1);
+        }
+      }
+
+      // Update HUD
+      info.textContent =
+        ship.gameOver ? 
+        `GAME OVER - ${gamertag}'s Final Score: ${ship.points}` :
+        `${gamertag} | Points:${ship.points} | Level:${ship.level} | `+
+        `Health:${Math.floor(ship.health)} | Ammo:${Math.floor(ship.ammo)} | `+
+        `Hyper-speed: ${hyperSpeed.current.toFixed(2)}s`;
+    }
+
+    // ——— Draw ———
+    function draw(){
+      // clear
+      ctx.clearRect(0,0,canvas.width,canvas.height);
+      
+      if(!gameStarted) {
+        return;
+      }
+
+      if(ship.gameOver) {
+        // Draw game over screen
+        ctx.fillStyle = 'rgba(0,0,0,0.8)';
+        ctx.fillRect(0,0,canvas.width,canvas.height);
+        ctx.fillStyle = '#f00';
+        ctx.font = '48px monospace';
+        ctx.textAlign = 'center';
+        ctx.fillText('GAME OVER', canvas.width/2, canvas.height/2);
+        ctx.font = '24px monospace';
+        ctx.fillText(`Final Score: ${ship.points}`, canvas.width/2, canvas.height/2 + 40);
+        return;
+      }
+
+      // Draw minimap
+      mctx.clearRect(0,0,minimap.width,minimap.height);
+      mctx.fillStyle = '#0f0';
+      // Draw player
+      mctx.beginPath();
+      mctx.arc(
+        (ship.pos.x + 3000) / 6000 * minimap.width,
+        (ship.pos.y + 3000) / 6000 * minimap.height,
+        3, 0, Math.PI*2
+      );
+      mctx.fill();
+      // Draw enemies
+      mctx.fillStyle = '#f00';
+      enemies.forEach(en => {
+        mctx.beginPath();
+        mctx.arc(
+          (en.pos.x + 3000) / 6000 * minimap.width,
+          (en.pos.y + 3000) / 6000 * minimap.height,
+          2, 0, Math.PI*2
+        );
+        mctx.fill();
+      });
+      // Draw planets
+      mctx.fillStyle = '#00f';
+      planets.forEach(p => {
+        mctx.beginPath();
+        mctx.arc(
+          (p.x + 3000) / 6000 * minimap.width,
+          (p.y + 3000) / 6000 * minimap.height,
+          Math.max(1, p.r / 100), 0, Math.PI*2
+        );
+        mctx.fill();
+      });
+      // Draw asteroids
+      mctx.fillStyle = '#ff0'; // yellow for asteroids
+      asteroids.forEach(ast => {
+        mctx.beginPath();
+        mctx.arc(
+          (ast.pos.x + 3000) / 6000 * minimap.width,
+          (ast.pos.y + 3000) / 6000 * minimap.height,
+          1.5, 0, Math.PI*2
+        );
+        mctx.fill();
+      });
+
+      // world camera
+      ctx.save();
+      ctx.translate(canvas.width/2 - ship.pos.x * zoom,
+                    canvas.height/2 - ship.pos.y * zoom);
+      ctx.scale(zoom, zoom);
+
+      // stars
+      for(const s of stars){
+        ctx.save();
+        ctx.globalAlpha = s.a;
+        ctx.fillStyle='#fff';
+        ctx.beginPath(); ctx.arc(s.x,s.y,s.r,0,Math.PI*2); ctx.fill();
+        ctx.restore();
+      }
+
+      // planets
+      for(const p of planets){
+        ctx.save();
+        ctx.translate(p.x, p.y);
+        ctx.beginPath();
+        ctx.arc(0, 0, p.r, 0, Math.PI*2);
+        ctx.closePath();
+        ctx.clip();
+        // Main body gradient
+        const mainGrad = ctx.createRadialGradient(0, 0, p.r * 0.1, 0, 0, p.r);
+        mainGrad.addColorStop(0, `hsl(${p._hue},${p._sat+10}%,${p._light+30}%)`);
+        mainGrad.addColorStop(0.3, `hsl(${p._hue},${p._sat}%,${p._light+10}%)`);
+        mainGrad.addColorStop(0.7, `hsl(${p._hue},${p._sat-10}%,${p._light}%)`);
+        mainGrad.addColorStop(1, `hsl(${p._hue},${p._sat-20}%,${p._light-10}%)`);
+        ctx.fillStyle = mainGrad;
+        ctx.beginPath();
+        ctx.arc(0, 0, p.r, 0, Math.PI*2);
+        ctx.closePath();
+        ctx.fill();
+        // Smooth, solid bands
+        for(const band of p._bands){
+          ctx.save();
+          ctx.globalAlpha = band.alpha;
+          ctx.beginPath();
+          for(let t=0; t<=100; t++){
+            let angle = (t/100)*Math.PI*2;
+            let px = Math.cos(angle) * (p.r - 1);
+            let py = band.y + Math.sin(angle) * band.height/2 + band.wobble[t]*p.r;
+            if(t===0) ctx.moveTo(px, py);
+            else ctx.lineTo(px, py);
+          }
+          ctx.lineTo(0,0);
+          ctx.closePath();
+          ctx.fillStyle = `hsl(${band.hue},${band.sat}%,${band.light}%)`;
+          ctx.fill();
+          ctx.restore();
+        }
+        // Spots
+        for(const spot of p._spots){
+          let grad = ctx.createRadialGradient(spot.spotX, spot.spotY, 0, spot.spotX, spot.spotY, spot.spotR);
+          grad.addColorStop(0, `hsla(${spot.spotHue},${spot.spotSat}%,${spot.spotLight+10}%,0.7)`);
+          grad.addColorStop(1, `hsla(${spot.spotHue},${spot.spotSat-10}%,${spot.spotLight-10}%,0)`);
+          ctx.save();
+          ctx.globalAlpha = 0.7;
+          ctx.beginPath();
+          ctx.arc(spot.spotX, spot.spotY, spot.spotR, 0, Math.PI*2);
+          ctx.closePath();
+          ctx.fillStyle = grad;
+          ctx.fill();
+          ctx.restore();
+        }
+        // Soft shadow (night side)
+        let shadowGrad = ctx.createRadialGradient(-p.r*0.3, -p.r*0.3, p.r*0.2, -p.r*0.3, -p.r*0.3, p.r*1.1);
+        shadowGrad.addColorStop(0, 'rgba(0,0,0,0)');
+        shadowGrad.addColorStop(0.5, 'rgba(0,0,0,0.15)');
+        shadowGrad.addColorStop(1, 'rgba(0,0,0,0.55)');
+        ctx.globalAlpha = 1;
+        ctx.beginPath();
+        ctx.arc(0, 0, p.r, 0, Math.PI*2);
+        ctx.closePath();
+        ctx.fillStyle = shadowGrad;
+        ctx.fill();
+        // Highlight (day side)
+        let highlightGrad = ctx.createRadialGradient(p.r*0.5, -p.r*0.5, 0, p.r*0.5, -p.r*0.5, p.r*0.7);
+        highlightGrad.addColorStop(0, 'rgba(255,255,255,0.25)');
+        highlightGrad.addColorStop(1, 'rgba(255,255,255,0)');
+        ctx.globalAlpha = 1;
+        ctx.beginPath();
+        ctx.arc(0, 0, p.r, 0, Math.PI*2);
+        ctx.closePath();
+        ctx.fillStyle = highlightGrad;
+        ctx.fill();
+        ctx.restore();
+      }
+
+      // player lasers
+      ctx.fillStyle='red';
+      lasers.forEach(l=>{
+        ctx.save();
+        ctx.translate(l.x,l.y);
+        ctx.rotate(l.angle);
+        ctx.fillRect(0,-2,20,4);
+        ctx.restore();
+      });
+
+      // enemy lasers
+      ctx.fillStyle='orange';
+      eLasers.forEach(l=>{
+        ctx.save();
+        ctx.translate(l.x,l.y);
+        ctx.rotate(l.angle);
+        ctx.fillRect(0,-2,16,4);
+        ctx.restore();
+      });
+
+      // enemies
+      enemies.forEach(en=>{
+        ctx.save();
+        ctx.translate(en.pos.x,en.pos.y);
+        // health bar
+        ctx.fillStyle='black';
+        ctx.fillRect(-en.size,-en.size-6,en.size*2,4);
+        ctx.fillStyle='lime';
+        ctx.fillRect(-en.size,-en.size-6,
+          (en.health/30)*(en.size*2),4);
+        // hyperspeed bar
+        ctx.fillStyle='black';
+        ctx.fillRect(-en.size,-en.size-12,en.size*2,4);
+        ctx.fillStyle='cyan';
+        ctx.fillRect(-en.size,-en.size-12,
+          (en.hyperSpeed.current/en.hyperSpeed.max)*(en.size*2),4);
+        // ship
+        ctx.rotate(Math.atan2(ship.pos.y-en.pos.y,
+                              ship.pos.x-en.pos.x));
+        ctx.fillStyle='#f80';
+        ctx.beginPath();
+        ctx.moveTo(en.size,0);
+        ctx.lineTo(-en.size/2,en.size/2);
+        ctx.lineTo(-en.size/2,-en.size/2);
+        ctx.closePath(); ctx.fill();
+        ctx.restore();
+      });
+
+      // Draw explosions
+      explosions.forEach(ex => {
+        const alpha = ex.life / ex.maxLife;
+        ctx.globalAlpha = alpha;
+        ctx.fillStyle = ex.color;
+        ctx.save();
+        ctx.translate(ex.x, ex.y);
+        ctx.rotate(ex.rotation);
+        ctx.scale(ex.scale, ex.scale);
+        // Draw pixelated square
+        ctx.fillRect(-ex.size/2, -ex.size/2, ex.size, ex.size);
+        ctx.restore();
+      });
+      ctx.globalAlpha = 1;
+
+      // player ship
+      ctx.save();
+      ctx.translate(ship.pos.x,ship.pos.y);
+      ctx.rotate(shipAngle());
+      // thruster flame
+      const speed = Math.hypot(ship.vel.x,ship.vel.y);
+      if(speed>0.5){
+        ctx.save();
+        ctx.translate(-ship.size,0);
+        const f = Math.min(speed*4,ship.size*1.2);
+        const grad = ctx.createLinearGradient(0,0,-f,0);
+        grad.addColorStop(0,'#f00'); grad.addColorStop(1,'#ff0');
+        ctx.fillStyle=grad;
+        ctx.beginPath();
+        ctx.moveTo(0,0);
+        ctx.lineTo(-f,7);
+        ctx.lineTo(-f,-7);
+        ctx.closePath(); ctx.fill();
+        ctx.restore();
+      }
+      // body
+      ctx.fillStyle = shipColor;
+      ctx.beginPath();
+      ctx.moveTo(ship.size,0);
+      ctx.lineTo(-ship.size/2, ship.size/2);
+      ctx.lineTo(-ship.size/2,-ship.size/2);
+      ctx.closePath(); ctx.fill();
+      ctx.restore();
+
+      // Draw asteroids
+      asteroids.forEach(ast => {
+        ctx.save();
+        ctx.translate(ast.pos.x, ast.pos.y);
+        ctx.rotate(ast.rotation);
+        
+        // Draw asteroid shape
+        ctx.beginPath();
+        ctx.moveTo(ast.shape[0].x, ast.shape[0].y);
+        for(let i = 1; i < ast.shape.length; i++) {
+          ctx.lineTo(ast.shape[i].x, ast.shape[i].y);
+        }
+        ctx.closePath();
+        
+        // Create gradient for asteroid
+        const gradient = ctx.createRadialGradient(0, 0, 0, 0, 0, ast.size);
+        gradient.addColorStop(0, '#666');
+        gradient.addColorStop(1, '#444');
+        ctx.fillStyle = gradient;
+        ctx.fill();
+        
+        // Add some surface details
+        ctx.strokeStyle = '#555';
+        ctx.lineWidth = 1;
+        ctx.stroke();
+        
+        ctx.restore();
+      });
+
+      ctx.restore();
+    }
+  })();
+  </script>
+</body>
+</html>
